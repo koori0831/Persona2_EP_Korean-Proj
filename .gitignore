@@ -5,3 +5,4 @@ p2_build/clean/*
 p2_build/iso/*
 !.gitkeep
 *.iso
+/p2_tool/node_modules

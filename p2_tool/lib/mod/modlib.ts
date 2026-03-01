@@ -522,6 +522,32 @@ let TOCSizeAlign = {
   bnp_files_off32: 2048,
   psp_arch: 16,
 };
+
+const detectBnpSectorEntrySize = (mips: MIPS, loc: number, count: number) => {
+  const sampleCount = Math.min(count, 64);
+  const scoreStride = (stride: 6 | 8) => {
+    let score = 0;
+    let prevOffset = -1;
+    for (let i = 0; i < sampleCount; i++) {
+      mips.org(loc + i * stride);
+      const sectorOff = mips.read_u16();
+      const sector = mips.read_u16();
+      const len = stride === 6 ? mips.read_u16() : mips.read_u32();
+      const offset = (sector << 11) + sectorOff;
+
+      if (sectorOff < 0x800) score++;
+      if (len > 0 && len < 0x200000) score++;
+      if (prevOffset < 0 || offset >= prevOffset) score++;
+      prevOffset = offset;
+    }
+    return score;
+  };
+
+  const score6 = scoreStride(6);
+  const score8 = scoreStride(8);
+  return score8 > score6 ? 8 : 6;
+};
+
 export const applyTOC = async (
   tocs: Record<string, TOCInfo>,
   dir: string,
@@ -600,6 +626,16 @@ export const applyTOC = async (
                 break;
               case "bnp_sector":
                 for (const loc of locs) {
+                  const entrySize = detectBnpSectorEntrySize(
+                    mips,
+                    loc,
+                    toc.length
+                  );
+                  console.log(
+                    `Detected ${entrySize}-byte bnp_sector table for ${name} at ${loc.toString(
+                      16
+                    )}`
+                  );
                   mips.org(loc);
                   for (const ent of toc) {
                     let off = ent.offset;
@@ -608,7 +644,16 @@ export const applyTOC = async (
                     let sector_off = off & 0x7ff;
                     mips.write_u16(sector_off);
                     mips.write_u16(sector);
-                    mips.write_u16(len);
+                    if (entrySize == 8) {
+                      mips.write_u32(len);
+                    } else {
+                      if (len > 0xffff) {
+                        throw new Error(
+                          `${name} TOC entry too large for 6-byte bnp_sector table: ${len}`
+                        );
+                      }
+                      mips.write_u16(len);
+                    }
                   }
                 }
                 break;
