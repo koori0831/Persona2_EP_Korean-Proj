@@ -523,35 +523,136 @@ let TOCSizeAlign = {
   psp_arch: 16,
 };
 
-const detectBnpSectorEntrySize = (mips: MIPS, loc: number, count: number) => {
-  const sampleCount = Math.min(count, 64);
-  const scoreStride = (stride: 6 | 8) => {
-    let score = 0;
-    let prevOffset = -1;
-    for (let i = 0; i < sampleCount; i++) {
-      mips.org(loc + i * stride);
-      const sectorOff = mips.read_u16();
-      const sector = mips.read_u16();
-      const len = stride === 6 ? mips.read_u16() : mips.read_u32();
-      const offset = (sector << 11) + sectorOff;
+interface BnpSectorStrideValidation {
+  valid: boolean;
+  reason: string;
+}
 
-      if (sectorOff < 0x800) score++;
-      if (len > 0 && len < 0x200000) score++;
-      if (prevOffset < 0 || offset >= prevOffset) score++;
-      prevOffset = offset;
+interface BnpSectorDetection {
+  entrySize: 6 | 8;
+  reason: string;
+}
+
+const validateBnpSectorStride = (
+  mips: MIPS,
+  loc: number,
+  count: number,
+  stride: 6 | 8,
+  maxBytes?: number
+): BnpSectorStrideValidation => {
+  if (maxBytes !== undefined) {
+    const span = count * stride;
+    if (span > maxBytes) {
+      return {
+        valid: false,
+        reason: `table span ${span} exceeds next TOC gap ${maxBytes}`,
+      };
     }
-    return score;
-  };
+  }
 
-  const score6 = scoreStride(6);
-  const score8 = scoreStride(8);
-  return score8 > score6 ? 8 : 6;
+  let prevOffset = -1;
+  for (let i = 0; i < count; i++) {
+    mips.org(loc + i * stride);
+    const sectorOff = mips.read_u16();
+    const sector = mips.read_u16();
+    const len = stride === 6 ? mips.read_u16() : mips.read_u32();
+    const offset = (sector << 11) + sectorOff;
+
+    if (sectorOff >= 0x800) {
+      return {
+        valid: false,
+        reason: `entry ${i}: sector offset out of range (${sectorOff})`,
+      };
+    }
+    if ((offset & 0x3) !== 0) {
+      return {
+        valid: false,
+        reason: `entry ${i}: file offset is not 4-byte aligned (0x${offset.toString(
+          16
+        )})`,
+      };
+    }
+    if (len < 8) {
+      return {
+        valid: false,
+        reason: `entry ${i}: file size is too small (${len})`,
+      };
+    }
+    if (prevOffset > offset) {
+      return {
+        valid: false,
+        reason: `entry ${i}: file offset decreased (0x${offset.toString(
+          16
+        )} < 0x${prevOffset.toString(16)})`,
+      };
+    }
+    prevOffset = offset;
+  }
+
+  return { valid: true, reason: "validated by structural checks" };
+};
+
+const detectBnpSectorEntrySize = (
+  mips: MIPS,
+  loc: number,
+  count: number,
+  maxBytes?: number
+): BnpSectorDetection => {
+  const check6 = validateBnpSectorStride(mips, loc, count, 6, maxBytes);
+  const check8 = validateBnpSectorStride(mips, loc, count, 8, maxBytes);
+
+  if (check6.valid && !check8.valid) {
+    return {
+      entrySize: 6,
+      reason: `8-byte rejected: ${check8.reason}`,
+    };
+  }
+  if (check8.valid && !check6.valid) {
+    return {
+      entrySize: 8,
+      reason: `6-byte rejected: ${check6.reason}`,
+    };
+  }
+  if (!check6.valid && !check8.valid) {
+    throw new Error(
+      `Unable to detect bnp_sector entry size at ${loc.toString(
+        16
+      )}: 6-byte invalid (${check6.reason}), 8-byte invalid (${check8.reason})`
+    );
+  }
+
+  throw new Error(
+    `Ambiguous bnp_sector entry size at ${loc.toString(
+      16
+    )}: both 6-byte and 8-byte layouts look valid`
+  );
+};
+
+const collectTOCLocations = (tocs: Record<string, TOCInfo>) => {
+  let locs: number[] = [];
+  for (const info of Object.values(tocs)) {
+    if (!info.location) continue;
+    if (typeof info.location === "string") {
+      locs.push(parseInt(info.location));
+    } else {
+      locs.push(...info.location.map((a) => parseInt(a)));
+    }
+  }
+  return [...new Set(locs)].sort((a, b) => a - b);
+};
+
+const findNextTOCLocation = (allLocs: number[], loc: number) => {
+  for (const candidate of allLocs) {
+    if (candidate > loc) return candidate;
+  }
+  return undefined;
 };
 
 export const applyTOC = async (
   tocs: Record<string, TOCInfo>,
   dir: string,
-  mips: MIPS
+  mips: MIPS,
+  allTOCLocations: number[] = collectTOCLocations(tocs)
 ) => {
   let files = await readDirWithTypes(dir);
   let promises = [];
@@ -626,15 +727,23 @@ export const applyTOC = async (
                 break;
               case "bnp_sector":
                 for (const loc of locs) {
-                  const entrySize = detectBnpSectorEntrySize(
+                  const nextLoc = findNextTOCLocation(allTOCLocations, loc);
+                  const maxBytes =
+                    nextLoc === undefined ? undefined : nextLoc - loc;
+                  const detected = detectBnpSectorEntrySize(
                     mips,
                     loc,
-                    toc.length
+                    toc.length,
+                    maxBytes
                   );
+                  const gapInfo =
+                    maxBytes === undefined
+                      ? "no next TOC boundary"
+                      : `next TOC gap=0x${maxBytes.toString(16)}`;
                   console.log(
-                    `Detected ${entrySize}-byte bnp_sector table for ${name} at ${loc.toString(
+                    `Detected ${detected.entrySize}-byte bnp_sector table for ${name} at ${loc.toString(
                       16
-                    )}`
+                    )} (${gapInfo}, ${detected.reason})`
                   );
                   mips.org(loc);
                   for (const ent of toc) {
@@ -644,7 +753,7 @@ export const applyTOC = async (
                     let sector_off = off & 0x7ff;
                     mips.write_u16(sector_off);
                     mips.write_u16(sector);
-                    if (entrySize == 8) {
+                    if (detected.entrySize == 8) {
                       mips.write_u32(len);
                     } else {
                       if (len > 0xffff) {
@@ -707,7 +816,7 @@ export const applyTOC = async (
         }
       }
     } else {
-      await applyTOC(tocs, joinPath(dir, file.name), mips);
+      await applyTOC(tocs, joinPath(dir, file.name), mips, allTOCLocations);
     }
   }
   // await Promise.all(promises);
